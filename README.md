@@ -1,15 +1,23 @@
-# CS2SPY — невидимка для админа (`!hide`)
+# CS2SPY
 
-Модуль [Admin System](https://github.com/Pisex/cs2-admin_system) для **Metamod:Source** на C++.
-Команда `!hide` и пункт **«Режим невидимки»** в админ-меню полностью прячут админа: его нет в табе,
-spec list'ы не видят, за кем он следит, а его сообщения и голос не раскрывают его присутствие.
+Невидимка для админа в Counter-Strike 2: модуль [Admin System](https://github.com/Pisex/cs2-admin_system) (C++, Metamod:Source, Linux x64).
 
-**Готовая сборка для сервера (Linux):**
+Команда `!hide` и пункт «Режим невидимки» в админ-меню полностью прячут админа: его нет в табе, spec list'ы не видят, за кем он следит, а его сообщения и голос не выдают его присутствие. Игрокам ничего устанавливать не нужно.
 
-- Metamod:Source 2.0 с KHook (сборки от 8 сентября 2026 и новее): [`release/hide-linux-x86_64.zip`](release/hide-linux-x86_64.zip)
-- Metamod:Source 1.12 / старый 2.0 с SourceHook: [`release/hide-sourcehook-linux-x86_64.zip`](release/hide-sourcehook-linux-x86_64.zip)
+## Скачать
 
-Версия **2.2.0**, изменения — в [CHANGELOG.md](CHANGELOG.md).
+Готовые сборки (собраны GitHub Actions в Ubuntu 20.04 под Steam Runtime, нужен вход в GitHub, ссылки действуют до 31.12.2026):
+
+- **Linux x64, Metamod:Source 2.0 (KHook):** [CS2SPY-2.2.0-linux-x64.zip](https://github.com/glazki2/CS2SPY/actions/runs/37036527625/artifacts/11241090207)
+- **Linux x64, Metamod:Source с SourceHook:** [CS2SPY-2.2.0-linux-x64-sourcehook.zip](https://github.com/glazki2/CS2SPY/actions/runs/37036527625/artifacts/11240775292)
+
+Свежие сборки после каждого коммита — во вкладке [Actions](https://github.com/glazki2/CS2SPY/actions/workflows/build.yml) (раздел Artifacts внизу запуска).
+
+Какую брать: под тот же Metamod, под который собраны ваши Utils и Admin System. Metamod 2.0 с KHook (сборки от 8 сентября 2026 и новее) не загружает плагины для SourceHook, и наоборот.
+
+**Обновление:** перед распаковкой новой версии сохраните свой `addons/configs/admin_system/hide.ini` — в пакете лежит конфиг по умолчанию, и он его перезапишет. Новые настройки, которых нет в вашем старом конфиге, работают со значениями по умолчанию.
+
+Изменения по версиям — в [CHANGELOG.md](CHANGELOG.md).
 
 ## Что умеет
 
@@ -32,8 +40,7 @@ spec list'ы не видят, за кем он следит, а его сооб�
 - Сервер CS2 на **Linux x64**.
 - [Admin System](https://github.com/Pisex/cs2-admin_system) и [Utils](https://github.com/Pisex/cs2-menus) **1.9.1+**.
   На более старых Utils модуль прячет только таб, чат и голос и пишет об этом в лог ошибок.
-- Metamod:Source. Сборку берите под **тот же** Metamod, под который собраны ваши Utils и Admin System:
-  Metamod 2.0 с KHook не загружает плагины для SourceHook, и наоборот.
+- Metamod:Source 2.0 с KHook или Metamod:Source с SourceHook — тот же, что у ваших Utils и Admin System (см. «Скачать»).
 
 ## Установка
 
@@ -103,10 +110,10 @@ spec list'ы не видят, за кем он следит, а его сооб�
 Выполните `meta info <номер>` или посмотрите строку загрузки модуля в начале лога.
 
 - `Plugin uses old SourceHook Metamod build (17 < 18)` — у вас Metamod 2.0 с KHook, а стоит сборка для SourceHook.
-  Возьмите `release/hide-linux-x86_64.zip`.
+  Возьмите сборку `CS2SPY-…-linux-x64.zip`.
 - `Plugin requires newer Metamod version (18 > 17)` — у вас Metamod с SourceHook. Возьмите
-  `release/hide-sourcehook-linux-x86_64.zip`.
-- `version 'GLIBC_2.xx' not found` — сборка не под Steam Runtime. Сборки из `release/` требуют не больше GLIBC 2.17.
+  сборку `CS2SPY-…-linux-x64-sourcehook.zip`.
+- `version 'GLIBC_2.xx' not found` — сборка не под Steam Runtime. Готовые сборки требуют не больше GLIBC 2.17.
 - Модуль выгрузился сам, в консоли `[Hide] Missing Utils system plugin` или `Missing Admin system plugin` —
   не загружены Utils или Admin System. Проверьте их в `meta list`: если они в `<ERROR>`, модуль работать не будет.
 
@@ -120,7 +127,7 @@ spec list'ы не видят, за кем он следит, а его сооб�
 
 ## Для разработчиков других плагинов
 
-Модуль отдаёт интерфейс [`Hide/include/hide.h`](Hide/include/hide.h):
+Модуль отдаёт интерфейс [`src/include/hide.h`](src/include/hide.h):
 
 ```cpp
 #include "hide.h"
@@ -136,17 +143,16 @@ if (ret != META_IFACE_FAILED && pHide && pHide->IsClientHidden(iSlot))
 ## Сборка
 
 ```bash
-./build.sh              # обе сборки в release/
-./build.sh khook        # только Metamod 2.0 (KHook)
-./build.sh sourcehook   # только SourceHook
+./build-linux.sh              # обе сборки в dist/
+./build-linux.sh khook        # только Metamod 2.0 (KHook)
+./build-linux.sh sourcehook   # только SourceHook
 ```
 
 Нужны `git`, `python3` с [AMBuild](https://github.com/alliedmodders/ambuild), `clang` и `zip`. Скрипт сам скачивает
 hl2sdk и Metamod:Source на проверенных коммитах в `external/`. Собирайте на glibc 2.31 или старше (Ubuntu 20.04),
-иначе модуль не загрузится в Steam Runtime. GitHub Actions собирает обе версии после каждого коммита
-(вкладка [Actions](https://github.com/glazki2/CS2SPY/actions/workflows/build.yml), артефакт `hide-linux-x86_64`).
+иначе модуль не загрузится в Steam Runtime. GitHub Actions собирает обе версии после каждого коммита.
 
-После крупных обновлений CS2 модуль нужно пересобрать с более новым hl2sdk (`HL2SDK_REF` в `build.sh`).
+После крупных обновлений CS2 модуль нужно пересобрать с более новым hl2sdk (`HL2SDK_REF` в `build-linux.sh`).
 
 ## Лицензия
 

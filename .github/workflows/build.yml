@@ -4,15 +4,16 @@ on:
   push:
     paths-ignore:
       - '**.md'
-      - 'release/**'
   pull_request:
     paths-ignore:
       - '**.md'
-      - 'release/**'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  build:
+  linux:
     runs-on: ubuntu-latest
     # glibc 2.31, same as the Steam Runtime (sniper) CS2 servers run in
     container:
@@ -28,16 +29,21 @@ jobs:
           ln -sf /usr/bin/clang++-10 /usr/bin/clang++
           python3 -m pip install -q git+https://github.com/alliedmodders/ambuild
 
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Build
-        run: ./build.sh
+      - name: Build Linux x64
+        run: |
+          ./build-linux.sh
+          echo "VERSION=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_ENV"
 
-      - name: Upload
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: hide-linux-x86_64
-          path: |
-            release/hide-linux-x86_64.zip
-            release/hide-sourcehook-linux-x86_64.zip
+          name: CS2SPY-${{ env.VERSION }}-linux-x64
+          path: dist/CS2SPY-${{ env.VERSION }}-linux-x64.zip
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CS2SPY-${{ env.VERSION }}-linux-x64-sourcehook
+          path: dist/CS2SPY-${{ env.VERSION }}-linux-x64-sourcehook.zip
+          if-no-files-found: error

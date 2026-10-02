@@ -19,7 +19,7 @@ New:
 - `auto_hide_permission`: admins with it join hidden (the permission has to be given explicitly).
 - `!hidelist` / `mm_hidelist`: hidden admins, for admins only.
 - Several permissions in `permission`, separated by `|`.
-- Two server builds: Metamod:Source 2.0 with KHook (plugin API 18) and Metamod with SourceHook (plugin API 17); `build.sh` builds both.
+- Two server builds: Metamod:Source 2.0 with KHook (plugin API 18) and Metamod with SourceHook (plugin API 17); `build-linux.sh` builds both.
 
 ## 2.1.2
 

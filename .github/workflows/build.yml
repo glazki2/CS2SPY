@@ -4,23 +4,15 @@ on:
   push:
     paths-ignore:
       - '**.md'
+      - 'release/**'
   pull_request:
     paths-ignore:
       - '**.md'
+      - 'release/**'
   workflow_dispatch:
-
-env:
-  # hl2sdk (cs2 branch) the module was tested with
-  HL2SDK_REF: 22087f532ec572d0965c11cdf0f9c245e65ac71b
-  # Last Metamod:Source commit with SourceHook (plugin API 17).
-  # Utils / Admin System are SourceHook plugins: a module built against
-  # Metamod 2.0 with KHook (API 18) would not load next to them.
-  MMS_REF: 7ec0f16948ab3a0910a98b4ac10e1c0e360d5339
 
 jobs:
   build:
-    permissions:
-      contents: write
     runs-on: ubuntu-latest
     # glibc 2.31, same as the Steam Runtime (sniper) CS2 servers run in
     container:
@@ -39,44 +31,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Checkout hl2sdk and Metamod:Source
-        run: |
-          fetch() {
-            git init -q "$2"
-            git -C "$2" fetch -q --depth 1 "$1" "$3"
-            git -C "$2" checkout -q FETCH_HEAD
-          }
-          mkdir -p external
-          fetch https://github.com/alliedmodders/hl2sdk.git external/hl2sdk-cs2 "$HL2SDK_REF"
-          fetch https://github.com/alliedmodders/metamod-source.git external/metamod-source "$MMS_REF"
-
       - name: Build
-        run: |
-          cd Hide
-          mkdir build
-          cd build
-          CC=clang CXX=clang++ python3 ../configure.py -s cs2 --targets x86_64 --enable-optimize \
-            --hl2sdk-manifests=./hl2sdk-manifests \
-            --mms_path="$GITHUB_WORKSPACE/external/metamod-source" \
-            --hl2sdk-root="$GITHUB_WORKSPACE/external"
-          ambuild
-
-      - name: Package
-        run: |
-          cd Hide/build/package
-          zip -r "$GITHUB_WORKSPACE/Hide.zip" addons
+        run: ./build.sh
 
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: Hide
-          path: Hide.zip
-
-      - name: Release
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: build-${{ github.run_number }}
-          name: Hide (build ${{ github.run_number }})
-          files: Hide.zip
-          make_latest: true
+          name: hide-linux-x86_64
+          path: |
+            release/hide-linux-x86_64.zip
+            release/hide-sourcehook-linux-x86_64.zip

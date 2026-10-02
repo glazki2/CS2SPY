@@ -33,7 +33,7 @@ IAdminApi* g_pAdmin = nullptr;
 struct HideConfig
 {
 	std::string sPermission = "@admin/hide";
-	std::vector<std::string> vChatCommands = {"!hide"};
+	std::vector<std::string> vChatCommands = {"!hide", "/hide"};
 	std::vector<std::string> vConsoleCommands = {"mm_hide"};
 	bool bMenuItem = true;
 	std::string sMenuCategory = "server";
@@ -291,7 +291,7 @@ void LoadConfig()
 		return;
 	}
 	g_Config.sPermission = kv.GetString("permission", "@admin/hide");
-	g_Config.vChatCommands = SplitString(kv.GetString("chat_commands", "!hide"), ';');
+	g_Config.vChatCommands = SplitString(kv.GetString("chat_commands", "!hide;/hide"), ';');
 	g_Config.vConsoleCommands = SplitString(kv.GetString("console_commands", "mm_hide"), ';');
 	g_Config.bMenuItem = kv.GetInt("menu_item", 1) != 0;
 	g_Config.sMenuCategory = kv.GetString("menu_category", "server");
@@ -832,7 +832,7 @@ const char* Hide::GetLicense()
 
 const char* Hide::GetVersion()
 {
-	return "2.1.0";
+	return "2.1.1";
 }
 
 const char* Hide::GetDate()

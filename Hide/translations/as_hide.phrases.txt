@@ -20,9 +20,15 @@
 	}
 	"Hide_Off_Team"
 	{
-		"ru"	"Режим невидимки {LIGHTRED}выключен{DEFAULT}: вас перевели в команду"
-		"ua"	"Режим невидимки {LIGHTRED}вимкнено{DEFAULT}: вас перевели в команду"
-		"en"	"Hide mode {LIGHTRED}disabled{DEFAULT}: you were moved to a team"
+		"ru"	"Режим невидимки {LIGHTRED}выключен{DEFAULT}: вас перевели в другую команду"
+		"ua"	"Режим невидимки {LIGHTRED}вимкнено{DEFAULT}: вас перевели в іншу команду"
+		"en"	"Hide mode {LIGHTRED}disabled{DEFAULT}: you were moved to another team"
+	}
+	"Hide_Rehidden"
+	{
+		"ru"	"Вас перевели в команду - режим невидимки {GREEN}восстановлен"
+		"ua"	"Вас перевели в команду - режим невидимки {GREEN}відновлено"
+		"en"	"You were moved to a team - hide mode {GREEN}restored"
 	}
 	"Hide_Restored"
 	{

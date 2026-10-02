@@ -13,7 +13,7 @@ env:
   # hl2sdk (cs2 branch) the module was tested with
   HL2SDK_REF: 22087f532ec572d0965c11cdf0f9c245e65ac71b
   # Last Metamod:Source commit with SourceHook (plugin API 17).
-  # Utils / Admin System by Pisex are SourceHook plugins: a module built against
+  # Utils / Admin System are SourceHook plugins: a module built against
   # Metamod 2.0 with KHook (API 18) would not load next to them.
   MMS_REF: 7ec0f16948ab3a0910a98b4ac10e1c0e360d5339
 

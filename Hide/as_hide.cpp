@@ -832,7 +832,7 @@ const char* Hide::GetLicense()
 
 const char* Hide::GetVersion()
 {
-	return "2.1.1";
+	return "2.1.2";
 }
 
 const char* Hide::GetDate()
@@ -847,7 +847,7 @@ const char *Hide::GetLogTag()
 
 const char* Hide::GetAuthor()
 {
-	return "Pisex, glazki2";
+	return "glazki";
 }
 
 const char* Hide::GetDescription()

@@ -1,6 +1,6 @@
 # [AS] Hide — невидимка для админа
 
-Модуль для [Admin System](https://github.com/Pisex/cs2-admin_system) от Pisex (Metamod:Source, CS2).
+Модуль для [Admin System](https://github.com/Pisex/cs2-admin_system) (Metamod:Source, CS2). Автор: glazki.
 Команда `!hide` и пункт **«Режим невидимки»** в админ-меню полностью прячут админа:
 
 - **таб (scoreboard)** — админа нет ни в командах, ни в списке наблюдателей

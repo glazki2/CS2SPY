@@ -1,0 +1,49 @@
+name: Build
+
+on:
+  push:
+    paths-ignore:
+      - '**.md'
+  pull_request:
+    paths-ignore:
+      - '**.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    # glibc 2.31, same as the Steam Runtime (sniper) CS2 servers run in
+    container:
+      image: ubuntu:20.04
+
+    steps:
+      - name: Install dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y -qq git ca-certificates clang-10 python3 python3-pip zip
+          ln -sf /usr/bin/clang-10 /usr/bin/clang
+          ln -sf /usr/bin/clang++-10 /usr/bin/clang++
+          python3 -m pip install -q git+https://github.com/alliedmodders/ambuild
+
+      - uses: actions/checkout@v4
+
+      - name: Build Linux x64
+        run: |
+          ./build-linux.sh
+          echo "VERSION=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CS2SPY-${{ env.VERSION }}-linux-x64
+          path: dist/CS2SPY-${{ env.VERSION }}-linux-x64.zip
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CS2SPY-${{ env.VERSION }}-linux-x64-sourcehook
+          path: dist/CS2SPY-${{ env.VERSION }}-linux-x64-sourcehook.zip
+          if-no-files-found: error

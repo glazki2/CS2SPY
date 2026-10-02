@@ -22,6 +22,10 @@
   В консоли сервера при загрузке видно: `[Hide] Utils 1.9.1: full mode`.
 - Metamod:Source с SourceHook (1.12 / 2.0 до перехода на KHook) — как и сами Utils/Admin System.
 
+## Скачать
+
+**[⬇ Hide.zip — последняя версия](https://github.com/glazki2/CS2SPY/releases/latest/download/Hide.zip)** · [все релизы](https://github.com/glazki2/CS2SPY/releases)
+
 ## Установка
 
 1. Если стоит стандартный `Hide` — удалите `addons/metamod/as_hide.vdf` и `addons/admin_modules/as_hide.so`
@@ -29,7 +33,7 @@
 2. Скопируйте папку `addons` из архива в `game/csgo/`.
 3. Перезапустите сервер или выполните `meta load addons/admin_modules/as_hide`.
 
-Архив собирается в GitHub Actions (вкладка **Actions → Build → артефакт `Hide`**).
+Архив собирается в GitHub Actions и после слияния в `main` публикуется в Releases.
 
 ## Использование
 

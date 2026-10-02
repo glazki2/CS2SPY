@@ -19,6 +19,8 @@ env:
 
 jobs:
   build:
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     # glibc 2.31, same as the Steam Runtime (sniper) CS2 servers run in
     container:
@@ -69,3 +71,12 @@ jobs:
         with:
           name: Hide
           path: Hide.zip
+
+      - name: Release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Hide (build ${{ github.run_number }})
+          files: Hide.zip
+          make_latest: true

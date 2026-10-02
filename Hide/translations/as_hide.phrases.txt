@@ -36,6 +36,36 @@
 		"ua"	"Режим невидимки {GREEN}відновлено{DEFAULT}. Не обирайте команду, щоб залишатися прихованим"
 		"en"	"Hide mode {GREEN}restored{DEFAULT}. Do not pick a team to stay hidden"
 	}
+	"Hide_Auto"
+	{
+		"ru"	"Вы зашли в режиме невидимки. Выключить: {GREEN}!hide"
+		"ua"	"Ви зайшли в режимі невидимки. Вимкнути: {GREEN}!hide"
+		"en"	"You joined in hide mode. Turn it off: {GREEN}!hide"
+	}
+	"Chat_Blocked"
+	{
+		"ru"	"Вы в режиме невидимки: другие игроки не видят ваши сообщения"
+		"ua"	"Ви в режимі невидимки: інші гравці не бачать ваші повідомлення"
+		"en"	"You are in hide mode: other players do not see your messages"
+	}
+	"Voice_Blocked"
+	{
+		"ru"	"Вы в режиме невидимки: вас не слышно"
+		"ua"	"Ви в режимі невидимки: вас не чути"
+		"en"	"You are in hide mode: nobody hears you"
+	}
+	"List"
+	{
+		"ru"	"Скрытые админы: {GREEN}"
+		"ua"	"Приховані адміни: {GREEN}"
+		"en"	"Hidden admins: {GREEN}"
+	}
+	"List_Empty"
+	{
+		"ru"	"Сейчас никто не скрыт"
+		"ua"	"Зараз ніхто не прихований"
+		"en"	"Nobody is hidden right now"
+	}
 	"NoAccess"
 	{
 		"ru"	"У вас нет доступа к этой команде"

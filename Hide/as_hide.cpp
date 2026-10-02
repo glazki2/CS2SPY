@@ -1,12 +1,14 @@
 #include <stdio.h>
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
 #include <set>
 #include <string>
-#include <tuple>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 #include "as_hide.h"
 #include "metamod_oslink.h"
@@ -30,18 +32,37 @@ IAdminApi* g_pAdmin = nullptr;
 #define TEAM_T 2
 #define TEAM_CT 3
 
+// Exposed by Utils since 1.9.1 - the release that added SetTransmitState listeners and
+// pre/post event hooks. Asking for it is safe on any version, unlike calling a method
+// an old Utils does not have.
+#define LAYOUT_INTERFACE_NAME "ILayoutApi"
+
+// A jointeam this soon after player_connect_full is the client re-joining its old team
+// by itself (map change), not a click in the team menu
+#define AUTO_JOIN_SECONDS 5.0
+
+typedef std::chrono::steady_clock Clock;
+
 struct HideConfig
 {
+	// "permission" as written in the config (the admin menu item takes it as is) and split by |
 	std::string sPermission = "@admin/hide";
+	std::vector<std::string> vPermissions = {"@admin/hide"};
+	std::string sAutoHidePermission;
 	std::vector<std::string> vChatCommands = {"!hide", "/hide"};
 	std::vector<std::string> vConsoleCommands = {"mm_hide"};
+	std::vector<std::string> vListChatCommands = {"!hidelist"};
+	std::vector<std::string> vListConsoleCommands = {"mm_hidelist"};
 	bool bMenuItem = true;
 	std::string sMenuCategory = "server";
 	std::string sMenuCategoryName = "Category_Server";
 	bool bHidePawn = true;
 	bool bSilentTeamChange = true;
 	bool bSilentDeath = true;
+	bool bSilentConnect = true;
 	bool bSilentDisconnect = true;
+	bool bBlockChat = true;
+	bool bBlockVoice = true;
 	bool bRehideOnSpectator = true;
 	bool bRehideOnTeamChange = true;
 	bool bBlockAutoTeam = true;
@@ -57,18 +78,23 @@ bool g_bHidden[MAX_SLOTS];
 // The hide sequence (suicide -> spectators -> unassigned) is running for the slot
 bool g_bApplying[MAX_SLOTS];
 // Team change events of the slot are not broadcast until this moment (used when leaving hide mode)
-std::chrono::steady_clock::time_point g_tSilentUntil[MAX_SLOTS];
-// player_connect_full: the client joins its old team by itself right after a map change
-std::chrono::steady_clock::time_point g_tConnectedAt[MAX_SLOTS];
-// The player picked a team himself (jointeam) since connecting
+Clock::time_point g_tSilentUntil[MAX_SLOTS];
+// player_connect_full of the current connection / map
+Clock::time_point g_tConnectedAt[MAX_SLOTS];
+// The player picked a team in the team menu himself since connecting
 bool g_bJoinedByPlayer[MAX_SLOTS];
 // Hidden admin put into a team by the server / other plugins: limited number of re-hides
 int g_iCorrections[MAX_SLOTS];
-std::chrono::steady_clock::time_point g_tFirstCorrection[MAX_SLOTS];
-// SteamID64 of admins that should get hide mode back after a map change / reconnect
+Clock::time_point g_tFirstCorrection[MAX_SLOTS];
+Clock::time_point g_tVoiceNotified[MAX_SLOTS];
+// Bumped on every (re)connect: cancels a restore that is still waiting for the old connection
+int g_iRestoreToken[MAX_SLOTS];
+// SteamID64 of admins that get hide mode back after a map change / reconnect (until server restart)
 std::unordered_set<uint64> g_setKeepHidden;
+// Admins with auto_hide_permission that turned hide mode off this session
+std::unordered_set<uint64> g_setAutoHideOptOut;
 
-// Utils 1.9.1+: SetTransmitState, entity listeners and pre event hooks are available
+// Utils 1.9.1+: SetTransmitState, entity listeners and pre/post event hooks are available
 bool g_bExtendedApi = false;
 
 std::set<CTimer*> g_setTimers;
@@ -118,6 +144,66 @@ void StartupServer()
 }
 
 ///////////////////////////////////////
+// Engine access in one place
+
+void RunServerCommand(const char* szCommand)
+{
+	engine->ServerCommand(szCommand);
+}
+
+CEntityInstance* GetEntityByIndex(int iIndex)
+{
+	return g_pEntitySystem ? g_pEntitySystem->GetEntityInstance(CEntityIndex(iIndex)) : nullptr;
+}
+
+CEntityInstance* GetEntityByHandle(const CEntityHandle& hEntity)
+{
+	return g_pEntitySystem ? g_pEntitySystem->GetEntityInstance(hEntity) : nullptr;
+}
+
+int GetEntityIndex(CEntityInstance* pEntity)
+{
+	return pEntity->GetEntityIndex().Get();
+}
+
+const char* GetEntityClassname(CEntityInstance* pEntity)
+{
+	return pEntity->GetClassname();
+}
+
+bool LoadKeyValuesFile(KeyValues& kv, const char* pszPath)
+{
+	return kv.LoadFromFile(g_pFullFileSystem, pszPath);
+}
+
+bool IsValidSlot(int iSlot)
+{
+	return iSlot >= 0 && iSlot < MAX_SLOTS;
+}
+
+double SecondsSince(Clock::time_point tPoint)
+{
+	return std::chrono::duration<double>(Clock::now() - tPoint).count();
+}
+
+std::vector<std::string> SplitString(const std::string& szString, char cDelimiter)
+{
+	std::vector<std::string> vecResult;
+	size_t iStart = 0;
+	while (iStart <= szString.size())
+	{
+		size_t iEnd = szString.find(cDelimiter, iStart);
+		if (iEnd == std::string::npos) iEnd = szString.size();
+		std::string sToken = szString.substr(iStart, iEnd - iStart);
+		size_t iFirst = sToken.find_first_not_of(" \t");
+		size_t iLast = sToken.find_last_not_of(" \t");
+		if (iFirst != std::string::npos) vecResult.push_back(sToken.substr(iFirst, iLast - iFirst + 1));
+		iStart = iEnd + 1;
+	}
+	return vecResult;
+}
+
+///////////////////////////////////////
 // Entity fields, resolved through the schema system of the running game
 
 #ifdef _WIN32
@@ -142,116 +228,89 @@ int FindSchemaOffset(CSchemaClassInfo* pClass, const char* szField)
 	return -1;
 }
 
-int GetSchemaOffset(const char* szClass, const char* szField)
+struct SchemaField
 {
-	static std::map<std::string, int> s_mOffsets;
-	std::string sKey = std::string(szClass) + "::" + szField;
-	auto it = s_mOffsets.find(sKey);
-	if (it != s_mOffsets.end()) return it->second;
+	const char* szClass;
+	const char* szField;
+	// -2: not resolved yet, -1: not found
+	int iOffset;
 
-	CSchemaSystemTypeScope* pScope = g_pSchemaSystem->FindTypeScopeForModule(SERVER_MODULE);
-	CSchemaClassInfo* pClass = pScope ? pScope->FindDeclaredClass(szClass).Get() : nullptr;
-	int iOffset = pClass ? FindSchemaOffset(pClass, szField) : -1;
-	// logged and cached once: this is called every tick
-	if (iOffset < 0) g_pUtils->ErrorLog("[%s] Schema field %s not found", g_PLAPI->GetLogTag(), sKey.c_str());
-	s_mOffsets[sKey] = iOffset;
-	return iOffset;
-}
+	int Offset()
+	{
+		if (iOffset != -2) return iOffset;
+		CSchemaSystemTypeScope* pScope = g_pSchemaSystem->FindTypeScopeForModule(SERVER_MODULE);
+		// the server module is not loaded yet: try again next time
+		if (!pScope) return -1;
+		CSchemaClassInfo* pClass = pScope->FindDeclaredClass(szClass).Get();
+		iOffset = pClass ? FindSchemaOffset(pClass, szField) : -1;
+		if (iOffset < 0) g_pUtils->ErrorLog("[%s] Schema field %s::%s not found", g_PLAPI->GetLogTag(), szClass, szField);
+		return iOffset;
+	}
+};
+
+SchemaField g_fTeamNum = {"CBaseEntity", "m_iTeamNum", -2};
+SchemaField g_fLifeState = {"CBaseEntity", "m_lifeState", -2};
+SchemaField g_fSteamID = {"CBasePlayerController", "m_steamID", -2};
+// the player model (CCSPlayerPawn)
+SchemaField g_fPlayerPawn = {"CCSPlayerController", "m_hPlayerPawn", -2};
+// free camera / spectating pawn (CCSObserverPawn), holds the observer target
+SchemaField g_fObserverPawn = {"CCSPlayerController", "m_hObserverPawn", -2};
+SchemaField g_fForceTeamTime = {"CCSPlayerController", "m_flForceTeamTime", -2};
 
 template<typename T>
-bool ReadField(CEntityInstance* pEntity, const char* szClass, const char* szField, T& value)
+bool ReadField(CEntityInstance* pEntity, SchemaField& field, T& value)
 {
 	if (!pEntity) return false;
-	int iOffset = GetSchemaOffset(szClass, szField);
+	int iOffset = field.Offset();
 	if (iOffset < 0) return false;
 	value = *reinterpret_cast<T*>(reinterpret_cast<uint8*>(pEntity) + iOffset);
 	return true;
 }
 
 template<typename T>
-bool WriteField(CEntityInstance* pEntity, const char* szClass, const char* szField, const T& value)
+bool WriteField(CEntityInstance* pEntity, SchemaField& field, const T& value)
 {
 	if (!pEntity) return false;
-	int iOffset = GetSchemaOffset(szClass, szField);
+	int iOffset = field.Offset();
 	if (iOffset < 0) return false;
 	*reinterpret_cast<T*>(reinterpret_cast<uint8*>(pEntity) + iOffset) = value;
-	g_pUtils->SetStateChanged(reinterpret_cast<CBaseEntity*>(pEntity), szClass, szField);
+	g_pUtils->SetStateChanged(reinterpret_cast<CBaseEntity*>(pEntity), field.szClass, field.szField);
 	return true;
 }
 
 CEntityInstance* GetController(int iSlot)
 {
-	if (!g_pEntitySystem) return nullptr;
-	CEntityInstance* pController = g_pEntitySystem->GetEntityInstance(CEntityIndex(iSlot + 1));
-	if (!pController || strcmp(pController->GetClassname(), "cs_player_controller")) return nullptr;
+	if (!IsValidSlot(iSlot)) return nullptr;
+	CEntityInstance* pController = GetEntityByIndex(iSlot + 1);
+	if (!pController || strcmp(GetEntityClassname(pController), "cs_player_controller")) return nullptr;
 	return pController;
 }
 
-CEntityInstance* GetHandleField(CEntityInstance* pEntity, const char* szClass, const char* szField)
+CEntityInstance* GetHandleField(CEntityInstance* pEntity, SchemaField& field)
 {
 	CEntityHandle hEntity;
-	if (!ReadField(pEntity, szClass, szField, hEntity) || !hEntity.IsValid()) return nullptr;
-	return g_pEntitySystem->GetEntityInstance(hEntity);
-}
-
-// m_hPlayerPawn - the player model (CCSPlayerPawn)
-CEntityInstance* GetPlayerPawn(CEntityInstance* pController)
-{
-	return GetHandleField(pController, "CCSPlayerController", "m_hPlayerPawn");
-}
-
-// m_hObserverPawn - free camera / spectating pawn (CCSObserverPawn), holds the observer target
-CEntityInstance* GetObserverPawn(CEntityInstance* pController)
-{
-	return GetHandleField(pController, "CCSPlayerController", "m_hObserverPawn");
-}
-
-// m_hPawn - the pawn the player currently controls (player or observer pawn)
-CEntityInstance* GetCurrentPawn(CEntityInstance* pController)
-{
-	return GetHandleField(pController, "CBasePlayerController", "m_hPawn");
+	if (!ReadField(pEntity, field, hEntity) || !hEntity.IsValid()) return nullptr;
+	return GetEntityByHandle(hEntity);
 }
 
 int GetTeam(CEntityInstance* pEntity)
 {
 	uint8 iTeam;
-	return ReadField(pEntity, "CBaseEntity", "m_iTeamNum", iTeam) ? iTeam : -1;
+	return ReadField(pEntity, g_fTeamNum, iTeam) ? iTeam : -1;
 }
 
 bool IsAlive(CEntityInstance* pEntity)
 {
 	uint8 iLifeState;
-	return ReadField(pEntity, "CBaseEntity", "m_lifeState", iLifeState) && iLifeState == LIFE_ALIVE;
+	return ReadField(pEntity, g_fLifeState, iLifeState) && iLifeState == LIFE_ALIVE;
 }
 
-bool IsValidSlot(int iSlot)
+// Utils knows the SteamID only after Steam authorization; the controller has it right after connecting
+uint64 GetSlotSteamID(int iSlot)
 {
-	return iSlot >= 0 && iSlot < MAX_SLOTS;
-}
-
-std::vector<std::string> SplitString(const std::string& szString, char cDelimiter)
-{
-	std::vector<std::string> vecResult;
-	size_t iStart = 0;
-	while (iStart <= szString.size())
-	{
-		size_t iEnd = szString.find(cDelimiter, iStart);
-		if (iEnd == std::string::npos) iEnd = szString.size();
-		std::string sToken = szString.substr(iStart, iEnd - iStart);
-		size_t iFirst = sToken.find_first_not_of(" \t");
-		size_t iLast = sToken.find_last_not_of(" \t");
-		if (iFirst != std::string::npos) vecResult.push_back(sToken.substr(iFirst, iLast - iFirst + 1));
-		iStart = iEnd + 1;
-	}
-	return vecResult;
-}
-
-bool IsUtilsVersionAtLeast(int iMajor, int iMinor, int iPatch)
-{
-	const char* szVersion = g_pUtils->GetVersion();
-	int a = 0, b = 0, c = 0;
-	if (!szVersion || sscanf(szVersion, "%d.%d.%d", &a, &b, &c) < 2) return false;
-	return std::tie(a, b, c) >= std::tie(iMajor, iMinor, iPatch);
+	uint64 iSteamID64 = g_pPlayers->GetSteamID64(iSlot);
+	if (!iSteamID64) ReadField(GetController(iSlot), g_fSteamID, iSteamID64);
+	return iSteamID64;
 }
 
 ///////////////////////////////////////
@@ -280,26 +339,37 @@ void Delay(float flDelay, std::function<void()> fn)
 ///////////////////////////////////////
 // Config & translations
 
+std::vector<std::string> ReadList(KeyValues& kv, const char* szKey, const char* szDefault)
+{
+	return SplitString(kv.GetString(szKey, szDefault), ';');
+}
+
 void LoadConfig()
 {
 	g_Config = HideConfig();
 	const char* pszPath = "addons/configs/admin_system/hide.ini";
 	KeyValues kv("Hide");
-	if (!kv.LoadFromFile(g_pFullFileSystem, pszPath))
+	if (!LoadKeyValuesFile(kv, pszPath))
 	{
 		g_pUtils->ErrorLog("[%s] Failed to load %s, using defaults", g_PLAPI->GetLogTag(), pszPath);
 		return;
 	}
 	g_Config.sPermission = kv.GetString("permission", "@admin/hide");
-	g_Config.vChatCommands = SplitString(kv.GetString("chat_commands", "!hide;/hide"), ';');
-	g_Config.vConsoleCommands = SplitString(kv.GetString("console_commands", "mm_hide"), ';');
+	g_Config.sAutoHidePermission = kv.GetString("auto_hide_permission", "");
+	g_Config.vChatCommands = ReadList(kv, "chat_commands", "!hide;/hide");
+	g_Config.vConsoleCommands = ReadList(kv, "console_commands", "mm_hide");
+	g_Config.vListChatCommands = ReadList(kv, "list_chat_commands", "!hidelist");
+	g_Config.vListConsoleCommands = ReadList(kv, "list_console_commands", "mm_hidelist");
 	g_Config.bMenuItem = kv.GetInt("menu_item", 1) != 0;
 	g_Config.sMenuCategory = kv.GetString("menu_category", "server");
 	g_Config.sMenuCategoryName = kv.GetString("menu_category_name", "Category_Server");
 	g_Config.bHidePawn = kv.GetInt("hide_pawn", 1) != 0;
 	g_Config.bSilentTeamChange = kv.GetInt("silent_team_change", 1) != 0;
 	g_Config.bSilentDeath = kv.GetInt("silent_death", 1) != 0;
+	g_Config.bSilentConnect = kv.GetInt("silent_connect", 1) != 0;
 	g_Config.bSilentDisconnect = kv.GetInt("silent_disconnect", 1) != 0;
+	g_Config.bBlockChat = kv.GetInt("block_chat", 1) != 0;
+	g_Config.bBlockVoice = kv.GetInt("block_voice", 1) != 0;
 	g_Config.bRehideOnSpectator = kv.GetInt("rehide_on_spectator", 1) != 0;
 	g_Config.bRehideOnTeamChange = kv.GetInt("rehide_on_team_change", 1) != 0;
 	g_Config.bBlockAutoTeam = kv.GetInt("block_auto_team", 1) != 0;
@@ -307,8 +377,15 @@ void LoadConfig()
 	g_Config.bAutoHideOnSpectate = kv.GetInt("auto_hide_on_spectate", 0) != 0;
 	g_Config.sTeamMenuRestore = kv.GetString("teamselect_menu_restore", "0");
 
+	g_Config.vPermissions = SplitString(g_Config.sPermission, '|');
+	if (g_Config.vPermissions.empty())
+	{
+		g_Config.sPermission = "@admin/hide";
+		g_Config.vPermissions = {g_Config.sPermission};
+	}
 	if (g_Config.sMenuCategory.empty()) g_Config.sMenuCategory = "server";
 	if (g_Config.sMenuCategoryName.empty()) g_Config.sMenuCategoryName = g_Config.sMenuCategory;
+	if (g_Config.sTeamMenuRestore != "1") g_Config.sTeamMenuRestore = "0";
 }
 
 void LoadPhrases()
@@ -316,7 +393,7 @@ void LoadPhrases()
 	g_mPhrases.clear();
 	const char* pszPath = "addons/translations/as_hide.phrases.txt";
 	KeyValues kv("Phrases");
-	if (!kv.LoadFromFile(g_pFullFileSystem, pszPath))
+	if (!LoadKeyValuesFile(kv, pszPath))
 	{
 		g_pUtils->ErrorLog("[%s] Failed to load %s", g_PLAPI->GetLogTag(), pszPath);
 		return;
@@ -336,10 +413,15 @@ const char* Phrase(const char* szKey)
 	return it != g_mPhrases.end() ? it->second.c_str() : szKey;
 }
 
+void PrintText(int iSlot, const std::string& sText)
+{
+	std::string sMessage = std::string(Phrase("Prefix")) + sText;
+	g_pUtils->PrintToChat(iSlot, "%s", sMessage.c_str());
+}
+
 void PrintPhrase(int iSlot, const char* szKey)
 {
-	std::string sText = std::string(Phrase("Prefix")) + Phrase(szKey);
-	g_pUtils->PrintToChat(iSlot, "%s", sText.c_str());
+	PrintText(iSlot, Phrase(szKey));
 }
 
 ///////////////////////////////////////
@@ -348,13 +430,13 @@ void PrintPhrase(int iSlot, const char* szKey)
 void RestoreTeamMenu()
 {
 	std::string sCommand = "sv_disable_teamselect_menu " + g_Config.sTeamMenuRestore;
-	engine->ServerCommand(sCommand.c_str());
+	RunServerCommand(sCommand.c_str());
 }
 
 // Several admins can hide at the same moment: the cvar is restored after the last one
 void LockTeamMenu()
 {
-	if (g_iTeamMenuLocks++ == 0) engine->ServerCommand("sv_disable_teamselect_menu 1");
+	if (g_iTeamMenuLocks++ == 0) RunServerCommand("sv_disable_teamselect_menu 1");
 }
 
 void UnlockTeamMenu()
@@ -370,20 +452,17 @@ void ResetHideState(int iSlot)
 {
 	g_bHidden[iSlot] = false;
 	g_bApplying[iSlot] = false;
-	g_tSilentUntil[iSlot] = std::chrono::steady_clock::time_point();
+	g_tSilentUntil[iSlot] = Clock::time_point();
 }
 
-// player_connect_full (also fires for every player after a map change) / disconnect
+// player_connect_full (fires for every player after a map change too) / disconnect
 void ResetConnectionState(int iSlot, bool bConnected)
 {
-	g_tConnectedAt[iSlot] = bConnected ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+	g_tConnectedAt[iSlot] = bConnected ? Clock::now() : Clock::time_point();
 	g_bJoinedByPlayer[iSlot] = false;
 	g_iCorrections[iSlot] = 0;
-}
-
-double SecondsSince(std::chrono::steady_clock::time_point tPoint)
-{
-	return std::chrono::duration<double>(std::chrono::steady_clock::now() - tPoint).count();
+	g_tVoiceNotified[iSlot] = Clock::time_point();
+	g_iRestoreToken[iSlot]++;
 }
 
 // Re-hiding is limited (3 times in 30 seconds) so it never fights another plugin forever
@@ -392,14 +471,65 @@ bool CanCorrect(int iSlot)
 	if (g_iCorrections[iSlot] == 0 || SecondsSince(g_tFirstCorrection[iSlot]) > 30.0)
 	{
 		g_iCorrections[iSlot] = 0;
-		g_tFirstCorrection[iSlot] = std::chrono::steady_clock::now();
+		g_tFirstCorrection[iSlot] = Clock::now();
 	}
 	return ++g_iCorrections[iSlot] <= 3;
 }
 
+bool IsHiddenOrHiding(int iSlot)
+{
+	return g_bHidden[iSlot] || g_bApplying[iSlot];
+}
+
 bool IsTeamChangeSilenced(int iSlot)
 {
-	return g_bHidden[iSlot] || g_bApplying[iSlot] || std::chrono::steady_clock::now() < g_tSilentUntil[iSlot];
+	return IsHiddenOrHiding(iSlot) || Clock::now() < g_tSilentUntil[iSlot];
+}
+
+bool HasHideAccess(int iSlot)
+{
+	for (const auto& sPermission : g_Config.vPermissions)
+	{
+		if (g_pAdmin->HasPermission(iSlot, sPermission.c_str())) return true;
+	}
+	return false;
+}
+
+// auto_hide_permission has to be given explicitly: @admin/root alone does not count
+bool HasAutoHidePermission(int iSlot)
+{
+	if (g_Config.sAutoHidePermission.empty()) return false;
+	for (const auto& sPermission : g_pAdmin->GetAdminPermissions(iSlot))
+	{
+		if (sPermission == g_Config.sAutoHidePermission) return true;
+	}
+	return false;
+}
+
+// Should this admin be hidden as soon as he is in game (map change, reconnect, auto hide)
+bool WantsHide(int iSlot, uint64 iSteamID64)
+{
+	if (!iSteamID64) return false;
+	if (g_Config.bKeepHidden && g_setKeepHidden.count(iSteamID64)) return true;
+	return !g_setAutoHideOptOut.count(iSteamID64) && HasAutoHidePermission(iSlot);
+}
+
+// The admin wants to stay hidden: remembered for map changes / reconnects
+void RememberHide(int iSlot)
+{
+	uint64 iSteamID64 = GetSlotSteamID(iSlot);
+	if (!iSteamID64) return;
+	g_setAutoHideOptOut.erase(iSteamID64);
+	if (g_Config.bKeepHidden) g_setKeepHidden.insert(iSteamID64);
+}
+
+// The admin is visible now: no restore / auto hide until he hides again
+void ForgetHide(int iSlot)
+{
+	uint64 iSteamID64 = GetSlotSteamID(iSlot);
+	if (!iSteamID64) return;
+	g_setKeepHidden.erase(iSteamID64);
+	if (HasAutoHidePermission(iSlot)) g_setAutoHideOptOut.insert(iSteamID64);
 }
 
 void EnableHide(int iSlot, const char* szNotifyPhrase)
@@ -414,7 +544,7 @@ void EnableHide(int iSlot, const char* szNotifyPhrase)
 		CEntityInstance* pController = GetController(iSlot);
 		if (g_bHidden[iSlot] && pController && g_pPlayers->IsInGame(iSlot))
 		{
-			if (IsAlive(GetPlayerPawn(pController))) g_pPlayers->CommitSuicide(iSlot, false, true);
+			if (IsAlive(GetHandleField(pController, g_fPlayerPawn))) g_pPlayers->CommitSuicide(iSlot, false, true);
 			// Through spectators first so the client gets a free observer camera,
 			// then "unassigned": players without a team are not listed in the scoreboard
 			g_pPlayers->ChangeTeam(iSlot, TEAM_SPECTATOR);
@@ -432,16 +562,11 @@ void DisableHide(int iSlot, bool bMoveToSpectators, bool bSilent, const char* sz
 {
 	if (!g_bHidden[iSlot]) return;
 	g_bHidden[iSlot] = false;
-	g_setKeepHidden.erase(g_pPlayers->GetSteamID64(iSlot));
-	if (bSilent) g_tSilentUntil[iSlot] = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+	ForgetHide(iSlot);
+	if (bSilent) g_tSilentUntil[iSlot] = Clock::now() + std::chrono::milliseconds(500);
 	g_pAdmin->SendAction(iSlot, "hide_off", "");
 	if (bMoveToSpectators) g_pPlayers->ChangeTeam(iSlot, TEAM_SPECTATOR);
 	if (szNotifyPhrase) PrintPhrase(iSlot, szNotifyPhrase);
-}
-
-bool HasHideAccess(int iSlot)
-{
-	return g_pAdmin->HasPermission(iSlot, g_Config.sPermission.c_str());
 }
 
 void ToggleHide(int iSlot)
@@ -458,32 +583,108 @@ void ToggleHide(int iSlot)
 		DisableHide(iSlot, true, true, "Hide_Off");
 		return;
 	}
-	if (g_Config.bKeepHidden) g_setKeepHidden.insert(g_pPlayers->GetSteamID64(iSlot));
+	RememberHide(iSlot);
 	EnableHide(iSlot, "Hide_On");
 }
 
-// Gives hide mode back to an admin that had it before a map change / reconnect
-void RestoreHide(int iSlot, uint64 iSteamID64)
+// Hides an admin that comes back after a map change / reconnect (keep_hidden) or has
+// auto_hide_permission. Waits until the player is loaded and his admin data is in.
+void StartRestore(int iSlot)
 {
+	uint64 iSteamID64 = GetSlotSteamID(iSlot);
+	if (!iSteamID64) return;
+	bool bKept = g_Config.bKeepHidden && g_setKeepHidden.count(iSteamID64);
+	if (!bKept && g_Config.sAutoHidePermission.empty()) return;
+
+	int iToken = ++g_iRestoreToken[iSlot];
 	auto pAttempts = std::make_shared<int>(0);
-	Repeat(1.0f, [iSlot, iSteamID64, pAttempts]() {
-		if (++(*pAttempts) > 60) return false;
-		if (g_pPlayers->GetSteamID64(iSlot) != iSteamID64) return false;
-		if (!g_setKeepHidden.count(iSteamID64) || g_bHidden[iSlot]) return false;
-		// admin data is loaded asynchronously and the player has to be fully in game
-		if (!g_pPlayers->IsInGame(iSlot) || !HasHideAccess(iSlot)) return true;
-		CEntityInstance* pController = GetController(iSlot);
-		if (!pController || !GetCurrentPawn(pController)) return true;
-		int iTeam = GetTeam(pController);
-		if ((iTeam == TEAM_T || iTeam == TEAM_CT) && g_bJoinedByPlayer[iSlot])
-		{
-			// picked a team in the menu himself
-			g_setKeepHidden.erase(iSteamID64);
-			return false;
-		}
-		EnableHide(iSlot, "Hide_Restored");
+	Repeat(1.0f, [iSlot, iSteamID64, iToken, pAttempts]() {
+		if (g_iRestoreToken[iSlot] != iToken || ++(*pAttempts) > 120) return false;
+		if (IsHiddenOrHiding(iSlot) || g_bJoinedByPlayer[iSlot] || GetSlotSteamID(iSlot) != iSteamID64) return false;
+		if (g_tConnectedAt[iSlot] == Clock::time_point() || !g_pPlayers->IsInGame(iSlot) || !GetController(iSlot)) return true;
+		// admin data is loaded asynchronously after Steam authorization
+		if (!HasHideAccess(iSlot)) return true;
+		if (!WantsHide(iSlot, iSteamID64)) return false;
+		bool bKeptNow = g_Config.bKeepHidden && g_setKeepHidden.count(iSteamID64);
+		RememberHide(iSlot);
+		EnableHide(iSlot, bKeptNow ? "Hide_Restored" : "Hide_Auto");
 		return false;
 	});
+}
+
+// "jointeam 2 1" (Utils 1.8+) or "2 1" (older Utils)
+int ParseJoinTeam(const char* szContent)
+{
+	for (std::string sArg : SplitString(szContent ? szContent : "", ' '))
+	{
+		sArg.erase(std::remove(sArg.begin(), sArg.end(), '"'), sArg.end());
+		if (!sArg.empty() && sArg.find_first_not_of("0123456789") == std::string::npos) return atoi(sArg.c_str());
+	}
+	return -1;
+}
+
+// returning true swallows the command
+bool OnJoinTeam(int iSlot, const char* szContent)
+{
+	if (!IsValidSlot(iSlot)) return false;
+	if (g_bApplying[iSlot]) return true;
+
+	uint64 iSteamID64 = GetSlotSteamID(iSlot);
+	bool bWants = g_bHidden[iSlot] || WantsHide(iSlot, iSteamID64);
+	// Right after connecting / a map change the client re-joins its old team by itself:
+	// keep admins that stay hidden out of it, the rest is not the player's own choice either
+	if (g_tConnectedAt[iSlot] != Clock::time_point() && SecondsSince(g_tConnectedAt[iSlot]) < AUTO_JOIN_SECONDS) return bWants;
+
+	if (!g_bHidden[iSlot] && ParseJoinTeam(szContent) == TEAM_SPECTATOR && g_Config.bAutoHideOnSpectate && HasHideAccess(iSlot))
+	{
+		RememberHide(iSlot);
+		EnableHide(iSlot, "Hide_On");
+		return true;
+	}
+
+	// The player's own choice in the team menu
+	g_bJoinedByPlayer[iSlot] = true;
+	if (g_bHidden[iSlot]) DisableHide(iSlot, false, false, "Hide_Off");
+	else if (bWants) ForgetHide(iSlot);
+	return false;
+}
+
+// mp_force_pick_time moves players without a team into one: push the deadline away for hidden admins
+bool BlockAutoTeam()
+{
+	if (!g_Config.bBlockAutoTeam || !g_pEntitySystem) return true;
+	for (int i = 0; i < MAX_SLOTS; i++)
+	{
+		if (!g_bHidden[i] || g_bApplying[i]) continue;
+		CEntityInstance* pController = GetController(i);
+		float flForceTeamTime;
+		if (!ReadField(pController, g_fForceTeamTime, flForceTeamTime)) continue;
+		if (flForceTeamTime < 1.0e8f) WriteField(pController, g_fForceTeamTime, 1.0e9f);
+	}
+	return true;
+}
+
+void PrintHiddenList(int iSlot)
+{
+	std::string sNames;
+	for (int i = 0; i < MAX_SLOTS; i++)
+	{
+		if (!IsHiddenOrHiding(i)) continue;
+		if (!sNames.empty()) sNames += ", ";
+		sNames += g_pPlayers->GetPlayerName(i);
+	}
+	if (!IsValidSlot(iSlot))
+	{
+		META_CONPRINTF("[%s] %s\n", g_PLAPI->GetLogTag(), sNames.empty() ? "-" : sNames.c_str());
+		return;
+	}
+	if (!HasHideAccess(iSlot))
+	{
+		PrintPhrase(iSlot, "NoAccess");
+		return;
+	}
+	if (sNames.empty()) PrintPhrase(iSlot, "List_Empty");
+	else PrintText(iSlot, std::string(Phrase("List")) + sNames);
 }
 
 ///////////////////////////////////////
@@ -492,7 +693,9 @@ void RestoreHide(int iSlot, uint64 iSteamID64)
 
 void UpdateTransmitState()
 {
-	std::map<int, int> mDesired;
+	// entity index -> owner slot; reused every tick without allocations
+	static std::vector<std::pair<int, int>> s_vecDesired;
+	s_vecDesired.clear();
 	if (g_Config.bHidePawn && g_pEntitySystem)
 	{
 		for (int i = 0; i < MAX_SLOTS; i++)
@@ -500,18 +703,25 @@ void UpdateTransmitState()
 			if (!g_bHidden[i] || g_bApplying[i]) continue;
 			CEntityInstance* pController = GetController(i);
 			if (!pController) continue;
-			CEntityInstance* pObserverPawn = GetObserverPawn(pController);
-			if (pObserverPawn) mDesired[pObserverPawn->GetEntityIndex().Get()] = i;
+			CEntityInstance* pObserverPawn = GetHandleField(pController, g_fObserverPawn);
+			if (pObserverPawn) s_vecDesired.emplace_back(GetEntityIndex(pObserverPawn), i);
 			// dead body (never hide a living pawn, it would desync the game for others)
-			CEntityInstance* pPawn = GetPlayerPawn(pController);
-			if (pPawn && !IsAlive(pPawn)) mDesired[pPawn->GetEntityIndex().Get()] = i;
+			CEntityInstance* pPawn = GetHandleField(pController, g_fPlayerPawn);
+			if (pPawn && !IsAlive(pPawn)) s_vecDesired.emplace_back(GetEntityIndex(pPawn), i);
 		}
 	}
 
+	auto FindDesired = [](int iEntityIndex) {
+		for (const auto& entry : s_vecDesired)
+		{
+			if (entry.first == iEntityIndex) return entry.second;
+		}
+		return -1;
+	};
+
 	for (auto it = g_mTransmitHidden.begin(); it != g_mTransmitHidden.end();)
 	{
-		auto itDesired = mDesired.find(it->first);
-		if (itDesired == mDesired.end() || itDesired->second != it->second)
+		if (FindDesired(it->first) != it->second)
 		{
 			g_pUtils->SetTransmitState(it->first, true, {});
 			it = g_mTransmitHidden.erase(it);
@@ -519,7 +729,7 @@ void UpdateTransmitState()
 		else ++it;
 	}
 
-	for (const auto& [iEntityIndex, iOwner] : mDesired)
+	for (const auto& [iEntityIndex, iOwner] : s_vecDesired)
 	{
 		if (g_mTransmitHidden.count(iEntityIndex)) continue;
 		std::vector<int> vecSlots;
@@ -555,7 +765,7 @@ void RegisterMenuItem()
 	g_pAdmin->RegisterCategory(g_szMenuCategory, g_szMenuCategoryName, nullptr);
 	g_pAdmin->RegisterItem(g_szMenuIdentity, g_szMenuName, g_szMenuCategory, g_szMenuFlags,
 		[](int iSlot, const char* szCategory, const char* szIdentity, std::string& szItem) {
-			bool bHidden = IsValidSlot(iSlot) && g_bHidden[iSlot];
+			bool bHidden = IsValidSlot(iSlot) && IsHiddenOrHiding(iSlot);
 			szItem = std::string(Phrase("Menu_Item")) + " " + Phrase(bHidden ? "Menu_State_On" : "Menu_State_Off");
 		},
 		[](int iSlot, const char* szCategory, const char* szIdentity, const char* szItem) {
@@ -574,8 +784,71 @@ int GetEventSlot(IGameEvent* pEvent)
 	return IsValidSlot(iSlot) ? iSlot : -1;
 }
 
-void HookEventsExtended()
+// After a team change of a hidden admin. His own jointeam turns hide mode off before it,
+// so here it is the server (mp_force_pick_time), a balancer, another plugin or admin
+void OnPlayerTeam(IGameEvent* pEvent)
 {
+	int iSlot = GetEventSlot(pEvent);
+	if (iSlot == -1 || !g_bHidden[iSlot] || g_bApplying[iSlot] || pEvent->GetBool("disconnect")) return;
+	int iTeam = pEvent->GetInt("team");
+	if (iTeam == TEAM_NONE) return;
+	bool bRehide = (iTeam == TEAM_SPECTATOR && g_Config.bRehideOnSpectator) ||
+		((iTeam == TEAM_T || iTeam == TEAM_CT) && g_Config.bRehideOnTeamChange);
+	if (bRehide && CanCorrect(iSlot))
+	{
+		Delay(0.1f, [iSlot, iTeam]() {
+			if (!g_bHidden[iSlot] || g_bApplying[iSlot]) return;
+			if (GetTeam(GetController(iSlot)) != TEAM_NONE) EnableHide(iSlot, iTeam == TEAM_SPECTATOR ? nullptr : "Hide_Rehidden");
+		});
+	}
+	else DisableHide(iSlot, false, false, "Hide_Off_Team");
+}
+
+void OnPlayerConnectFull(IGameEvent* pEvent)
+{
+	int iSlot = GetEventSlot(pEvent);
+	if (iSlot == -1) return;
+	// a new connection or map: the hide state of the previous one is gone
+	ResetHideState(iSlot);
+	ResetConnectionState(iSlot, true);
+	StartRestore(iSlot);
+}
+
+void OnPlayerDisconnect(IGameEvent* pEvent)
+{
+	int iSlot = GetEventSlot(pEvent);
+	if (iSlot == -1) return;
+	// g_setKeepHidden keeps the SteamID: hide mode comes back after reconnect
+	ResetHideState(iSlot);
+	ResetConnectionState(iSlot, false);
+}
+
+void HookEvents()
+{
+	g_pUtils->HookEvent(g_PLID, "player_connect_full", [](const char* szName, IGameEvent* pEvent, bool bDontBroadcast) {
+		OnPlayerConnectFull(pEvent);
+	});
+
+	if (!g_bExtendedApi)
+	{
+		// Older Utils: HookEvent runs before the engine handles the event
+		g_pUtils->HookEvent(g_PLID, "player_team", [](const char* szName, IGameEvent* pEvent, bool bDontBroadcast) {
+			OnPlayerTeam(pEvent);
+		});
+		g_pUtils->HookEvent(g_PLID, "player_disconnect", [](const char* szName, IGameEvent* pEvent, bool bDontBroadcast) {
+			OnPlayerDisconnect(pEvent);
+		});
+		return;
+	}
+
+	// Post hooks run after the pre hooks below, so those still see the admin as hidden
+	g_pUtils->HookEventPost(g_PLID, "player_team", [](const char* szName, IGameEvent* pEvent, bool bDontBroadcast) {
+		OnPlayerTeam(pEvent);
+	});
+	g_pUtils->HookEventPost(g_PLID, "player_disconnect", [](const char* szName, IGameEvent* pEvent, bool bDontBroadcast) {
+		OnPlayerDisconnect(pEvent);
+	});
+
 	// "X is joining the Spectators" / unassigned messages of a hidden admin
 	g_pUtils->HookEventPre(g_PLID, "player_team", [](const char* szName, IGameEvent* pEvent, EventInfo* pInfo) {
 		if (!g_Config.bSilentTeamChange) return EventHookResult::Continue;
@@ -589,97 +862,54 @@ void HookEventsExtended()
 	g_pUtils->HookEventPre(g_PLID, "player_death", [](const char* szName, IGameEvent* pEvent, EventInfo* pInfo) {
 		if (!g_Config.bSilentDeath) return EventHookResult::Continue;
 		int iSlot = GetEventSlot(pEvent);
-		if (iSlot == -1 || (!g_bApplying[iSlot] && !g_bHidden[iSlot])) return EventHookResult::Continue;
+		if (iSlot == -1 || !IsHiddenOrHiding(iSlot)) return EventHookResult::Continue;
+		pInfo->bDontBroadcast = true;
+		return EventHookResult::Changed;
+	});
+	// "X connected": only known for admins that come back hidden (keep_hidden)
+	g_pUtils->HookEventPre(g_PLID, "player_connect", [](const char* szName, IGameEvent* pEvent, EventInfo* pInfo) {
+		if (!g_Config.bSilentConnect || !g_Config.bKeepHidden || pEvent->GetBool("bot")) return EventHookResult::Continue;
+		uint64 iSteamID64 = pEvent->GetUint64("xuid");
+		if (!iSteamID64 || !g_setKeepHidden.count(iSteamID64)) return EventHookResult::Continue;
 		pInfo->bDontBroadcast = true;
 		return EventHookResult::Changed;
 	});
 	g_pUtils->HookEventPre(g_PLID, "player_disconnect", [](const char* szName, IGameEvent* pEvent, EventInfo* pInfo) {
 		if (!g_Config.bSilentDisconnect) return EventHookResult::Continue;
 		int iSlot = GetEventSlot(pEvent);
-		if (iSlot == -1 || !g_bHidden[iSlot]) return EventHookResult::Continue;
+		if (iSlot == -1 || !IsHiddenOrHiding(iSlot)) return EventHookResult::Continue;
 		pInfo->bDontBroadcast = true;
 		return EventHookResult::Changed;
 	});
 }
 
-void HookEvents()
-{
-	g_pUtils->HookEvent(g_PLID, "player_team", [](const char* szName, IGameEvent* pEvent, bool bDontBroadcast) {
-		int iSlot = GetEventSlot(pEvent);
-		if (iSlot == -1 || !g_bHidden[iSlot] || g_bApplying[iSlot]) return;
-		if (pEvent->GetBool("disconnect")) return;
-		int iTeam = pEvent->GetInt("team");
-		// The admin's own jointeam turns hide mode off before this event,
-		// so here it is the server (mp_force_pick_time), a balancer, another plugin or admin
-		bool bRehide = (iTeam == TEAM_SPECTATOR && g_Config.bRehideOnSpectator) ||
-			((iTeam == TEAM_T || iTeam == TEAM_CT) && g_Config.bRehideOnTeamChange);
-		if (iTeam == TEAM_NONE) return;
-		if (bRehide && CanCorrect(iSlot))
-		{
-			Delay(0.1f, [iSlot, iTeam]() {
-				if (!g_bHidden[iSlot] || g_bApplying[iSlot]) return;
-				if (GetTeam(GetController(iSlot)) != TEAM_NONE) EnableHide(iSlot, iTeam == TEAM_SPECTATOR ? nullptr : "Hide_Rehidden");
-			});
-		}
-		else DisableHide(iSlot, false, false, "Hide_Off_Team");
-	});
-	g_pUtils->HookEvent(g_PLID, "player_connect_full", [](const char* szName, IGameEvent* pEvent, bool bDontBroadcast) {
-		int iSlot = GetEventSlot(pEvent);
-		if (iSlot != -1) ResetConnectionState(iSlot, true);
-	});
-	g_pUtils->HookEvent(g_PLID, "player_disconnect", [](const char* szName, IGameEvent* pEvent, bool bDontBroadcast) {
-		int iSlot = GetEventSlot(pEvent);
-		// g_setKeepHidden keeps the SteamID, hide mode comes back after reconnect
-		if (iSlot == -1) return;
-		ResetHideState(iSlot);
-		ResetConnectionState(iSlot, false);
-	});
-}
-
 ///////////////////////////////////////
+// Accidental reveal: chat and voice of a hidden admin
 
-bool OnJoinTeam(int iSlot, const char* szContent)
+bool OnChatPre(int iSlot, const char* szContent, bool bTeam)
 {
-	if (!IsValidSlot(iSlot)) return false;
-	// szContent is "jointeam <team> ..."
-	int iTeam = -1;
-	sscanf(szContent, "%*s %d", &iTeam);
-
-	if (g_bApplying[iSlot]) return true;
-
-	uint64 iSteamID64 = g_pPlayers->GetSteamID64(iSlot);
-	bool bPendingRestore = !g_bHidden[iSlot] && g_Config.bKeepHidden && g_setKeepHidden.count(iSteamID64);
-	// Right after a map change the client re-joins its old team by itself: keep the admin unassigned
-	if (bPendingRestore && SecondsSince(g_tConnectedAt[iSlot]) < 3.0) return true;
-
-	if (!g_bHidden[iSlot] && iTeam == TEAM_SPECTATOR && g_Config.bAutoHideOnSpectate && HasHideAccess(iSlot))
-	{
-		if (g_Config.bKeepHidden) g_setKeepHidden.insert(iSteamID64);
-		EnableHide(iSlot, "Hide_On");
-		return true;
-	}
-
-	// The admin's own choice in the team menu
-	g_bJoinedByPlayer[iSlot] = true;
-	if (g_bHidden[iSlot]) DisableHide(iSlot, false, false, "Hide_Off");
-	else if (bPendingRestore) g_setKeepHidden.erase(iSteamID64);
+	if (!g_Config.bBlockChat || !IsValidSlot(iSlot) || !IsHiddenOrHiding(iSlot)) return true;
+	const char* szText = szContent ? szContent : "";
+	while (*szText == ' ' || *szText == '"') szText++;
+	// commands go to their plugins, @ in team chat goes to the admin chat module:
+	// those plugins still get the message, it is only not shown to the players
+	bool bCommand = *szText == '!' || *szText == '/' || (bTeam && *szText == '@');
+	if (*szText && !bCommand) PrintPhrase(iSlot, "Chat_Blocked");
 	return false;
 }
 
-// mp_force_pick_time moves players without a team into one: push the deadline away for hidden admins
-bool BlockAutoTeam()
+bool OnHearingClient(int iSlot)
 {
-	if (!g_Config.bBlockAutoTeam || !g_pEntitySystem) return true;
-	for (int i = 0; i < MAX_SLOTS; i++)
+	if (!g_Config.bBlockVoice || !IsValidSlot(iSlot) || !g_bHidden[iSlot]) return true;
+	if (SecondsSince(g_tVoiceNotified[iSlot]) > 10.0)
 	{
-		if (!g_bHidden[i] || g_bApplying[i]) continue;
-		CEntityInstance* pController = GetController(i);
-		float flForceTeamTime;
-		if (!ReadField(pController, "CCSPlayerController", "m_flForceTeamTime", flForceTeamTime)) continue;
-		if (flForceTeamTime < 1.0e8f) WriteField(pController, "CCSPlayerController", "m_flForceTeamTime", 1.0e9f);
+		g_tVoiceNotified[iSlot] = Clock::now();
+		PrintPhrase(iSlot, "Voice_Blocked");
 	}
-	return true;
+	return false;
 }
+
+///////////////////////////////////////
 
 bool Hide::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen, bool late)
 {
@@ -717,7 +947,7 @@ bool Hide::Unload(char *error, size_t maxlen)
 	g_setTimers.clear();
 	g_mTransmitHidden.clear();
 
-	if (g_iTeamMenuLocks > 0 && engine) RestoreTeamMenu();
+	if (g_iTeamMenuLocks > 0) RestoreTeamMenu();
 	g_iTeamMenuLocks = 0;
 
 	// The core has no way to remove a menu item: keep it, but without callbacks into this (unloaded) module
@@ -752,7 +982,7 @@ void Hide::AllPluginsLoaded()
 		g_SMAPI->Format(error, sizeof(error), "Missing Utils system plugin");
 		ConColorMsg(Color(255, 0, 0, 255), "[%s] %s\n", GetLogTag(), error);
 		std::string sBuffer = "meta unload "+std::to_string(g_PLID);
-		engine->ServerCommand(sBuffer.c_str());
+		RunServerCommand(sBuffer.c_str());
 		return;
 	}
 	g_pPlayers = (IPlayersApi *)g_SMAPI->MetaFactory(PLAYERS_INTERFACE, &ret, NULL);
@@ -761,7 +991,7 @@ void Hide::AllPluginsLoaded()
 		g_pUtils->ErrorLog("[%s] Missing Players system plugin", GetLogTag());
 
 		std::string sBuffer = "meta unload "+std::to_string(g_PLID);
-		engine->ServerCommand(sBuffer.c_str());
+		RunServerCommand(sBuffer.c_str());
 		return;
 	}
 	g_pAdmin = (IAdminApi *)g_SMAPI->MetaFactory(Admin_INTERFACE, &ret, NULL);
@@ -770,15 +1000,14 @@ void Hide::AllPluginsLoaded()
 		g_pUtils->ErrorLog("[%s] Missing Admin system plugin", GetLogTag());
 
 		std::string sBuffer = "meta unload "+std::to_string(g_PLID);
-		engine->ServerCommand(sBuffer.c_str());
+		RunServerCommand(sBuffer.c_str());
 		return;
 	}
 
-	g_bExtendedApi = IsUtilsVersionAtLeast(1, 9, 1);
-	if (!g_bExtendedApi)
-	{
-		g_pUtils->ErrorLog("[%s] Utils %s is too old: hiding from spectator lists and silent events need Utils 1.9.1+. Only the scoreboard is hidden.", GetLogTag(), g_pUtils->GetVersion());
-	}
+	g_SMAPI->MetaFactory(LAYOUT_INTERFACE_NAME, &ret, NULL);
+	g_bExtendedApi = ret != META_IFACE_FAILED;
+	if (g_bExtendedApi) META_CONPRINTF("[%s] Utils %s: full mode\n", GetLogTag(), g_pUtils->GetVersion());
+	else g_pUtils->ErrorLog("[%s] Utils is older than 1.9.1: only the scoreboard is hidden (no spectator lists, no silent events). Update Utils.", GetLogTag());
 
 	LoadConfig();
 	LoadPhrases();
@@ -787,10 +1016,9 @@ void Hide::AllPluginsLoaded()
 	StartupServer();
 	g_pUtils->StartupServer(g_PLID, StartupServer);
 
+	// admin data is loaded after authorization: try the restore again (it waits for it)
 	g_pPlayers->HookOnClientAuthorized(g_PLID, [](int iSlot, uint64 iSteamID64) {
-		if (!IsValidSlot(iSlot)) return;
-		ResetHideState(iSlot);
-		if (g_Config.bKeepHidden && g_setKeepHidden.count(iSteamID64)) RestoreHide(iSlot, iSteamID64);
+		if (IsValidSlot(iSlot) && !IsHiddenOrHiding(iSlot)) StartRestore(iSlot);
 	});
 
 	g_pUtils->RegCommand(g_PLID, g_Config.vConsoleCommands, g_Config.vChatCommands, [](int iSlot, const char* szContent) {
@@ -802,16 +1030,17 @@ void Hide::AllPluginsLoaded()
 		ToggleHide(iSlot);
 		return true;
 	});
-	// returning true swallows the command
+	g_pUtils->RegCommand(g_PLID, g_Config.vListConsoleCommands, g_Config.vListChatCommands, [](int iSlot, const char* szContent) {
+		PrintHiddenList(iSlot);
+		return true;
+	});
 	g_pUtils->RegCommand(g_PLID, {"jointeam"}, {}, OnJoinTeam);
+	g_pUtils->AddChatListenerPre(g_PLID, OnChatPre);
+	g_pUtils->HookIsHearingClient(g_PLID, OnHearingClient);
 
 	HookEvents();
 	Repeat(1.0f, BlockAutoTeam);
-	if (g_bExtendedApi)
-	{
-		HookEventsExtended();
-		g_pUtils->AddEntityListener(g_PLID, &g_EntityListener);
-	}
+	if (g_bExtendedApi) g_pUtils->AddEntityListener(g_PLID, &g_EntityListener);
 
 	if (g_pAdmin->IsCoreLoaded()) RegisterMenuItem();
 	else
@@ -832,7 +1061,7 @@ const char* Hide::GetLicense()
 
 const char* Hide::GetVersion()
 {
-	return "2.1.2";
+	return "2.2.0";
 }
 
 const char* Hide::GetDate()
